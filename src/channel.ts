@@ -12,6 +12,10 @@ import type { QQChannelAccount, MessagePayload } from './types.js';
 const activeRuntimes: Map<string, QQChannelRuntime> = new Map();
 const apiClients: Map<string, QQApiClient> = new Map();
 
+// Store for preventing duplicate replies to the same message
+const recentReplies: Map<string, { text: string; timestamp: number }> = new Map();
+const REPLY_DEDUP_WINDOW_MS = 5000; // 5 seconds window for deduplication
+
 const DEFAULT_ACCOUNT_ID = 'default';
 
 /**
@@ -90,7 +94,7 @@ export const qqChannelPlugin: ChannelPlugin<QQChannelAccount> = {
     reactions: false,
     threads: false,
     media: true,
-    nativeCommands: false,
+    nativeCommands: true,  // Enable slash commands support
     blockStreaming: false,
   },
 
@@ -295,6 +299,9 @@ export const qqChannelPlugin: ChannelPlugin<QQChannelAccount> = {
           const fromLabel = isDirect ? senderName : `${senderName} in ${message.guild_id || message.channel_id}`;
           const timestamp = message.timestamp ? new Date(message.timestamp).getTime() : Date.now();
 
+          // Check if this is a control command
+          const isCommand = core.channel.text.hasControlCommand(messageText, cfg);
+
           // Format the message body
           const body = core.channel.reply.formatAgentEnvelope({
             channel: 'QQ Channel',
@@ -322,6 +329,7 @@ export const qqChannelPlugin: ChannelPlugin<QQChannelAccount> = {
             Provider: 'qq-channel',
             Surface: 'qq-channel',
             MessageSid: message.id,
+            CommandAuthorized: isCommand ? true : undefined,  // Enable command execution
             OriginatingChannel: 'qq-channel',
             OriginatingTo: `qq-channel:${message.channel_id}`,
           });
@@ -341,8 +349,36 @@ export const qqChannelPlugin: ChannelPlugin<QQChannelAccount> = {
                 responsePrefix,
                 humanDelay,
                 deliver: async (payload) => {
-                  const replyText = payload.text;
+                  let replyText = payload.text;
                   if (!replyText) return;
+
+                  // Filter sensitive URLs that QQ API rejects
+                  // Replace domain names with shortened versions to avoid content policy issues
+                  replyText = replyText
+                    .replace(/clawdhub\.com/g, 'clawdhub')
+                    .replace(/https?:\/\/[^\s)]+/g, '[link]');  // Replace URLs with [link] placeholder
+
+                  // QQ API has a message length limit (approximately 4000 characters)
+                  // Truncate if necessary to avoid API rejection
+                  const MAX_MESSAGE_LENGTH = 2000; // Try smaller limit to be safe
+                  if (replyText.length > MAX_MESSAGE_LENGTH) {
+                    const truncateMsg = '\n\n...(消息过长，已截断)';
+                    replyText = replyText.slice(0, MAX_MESSAGE_LENGTH - truncateMsg.length) + truncateMsg;
+                    console.log(`[QQ-Channel] Truncated long message from ${payload.text.length} to ${replyText.length} chars`);
+                  }
+
+                  // Log the message size for debugging
+                  console.log(`[QQ-Channel] Message size: ${replyText.length} chars, content preview: ${replyText.slice(0, 80).replace(/\n/g, ' ')}...`);
+
+                  // Deduplication: Skip if we already sent the same reply to this message recently
+                  const messageKey = `${message.channel_id}:${message.id}`;
+                  const lastReply = recentReplies.get(messageKey);
+                  const now = Date.now();
+
+                  if (lastReply && lastReply.text === replyText && (now - lastReply.timestamp) < REPLY_DEDUP_WINDOW_MS) {
+                    console.log('[QQ-Channel] Skipping duplicate reply to message:', message.id);
+                    return;
+                  }
 
                   console.log('[QQ-Channel] Sending AI reply:', replyText.slice(0, 100) + (replyText.length > 100 ? '...' : ''));
 
@@ -359,6 +395,16 @@ export const qqChannelPlugin: ChannelPlugin<QQChannelAccount> = {
                       content: replyText,
                       msg_id: message.id,  // Reply to the original message
                     });
+                  }
+
+                  // Record this reply
+                  recentReplies.set(messageKey, { text: replyText, timestamp: now });
+
+                  // Cleanup old entries
+                  for (const [key, value] of recentReplies.entries()) {
+                    if (now - value.timestamp > REPLY_DEDUP_WINDOW_MS) {
+                      recentReplies.delete(key);
+                    }
                   }
 
                   console.log('[QQ-Channel] AI reply sent successfully');
