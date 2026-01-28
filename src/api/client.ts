@@ -38,11 +38,12 @@ export class QQApiClient {
   /**
    * Get a valid access token, refreshing if necessary
    * QQ bots use a proprietary token endpoint, not standard OAuth 2.0
+   * @param forceRefresh - Force refresh the token even if not expired
    */
-  async getAccessToken(): Promise<string> {
+  async getAccessToken(forceRefresh = false): Promise<string> {
     const now = Date.now();
     // Refresh token 60 seconds before expiry (as recommended by QQ docs)
-    if (this.accessToken && this.tokenExpiresAt > now + 60 * 1000) {
+    if (!forceRefresh && this.accessToken && this.tokenExpiresAt > now + 60 * 1000) {
       return this.accessToken;
     }
 

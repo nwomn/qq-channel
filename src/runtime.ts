@@ -41,6 +41,17 @@ export interface RuntimeConfig {
 // Cache for access token used in WebSocket auth
 let cachedAccessToken: string | null = null;
 
+// Fatal error codes that should stop reconnection attempts
+const FATAL_CLOSE_CODES = [
+  4004, // Authentication failed
+  4010, // Invalid shard
+  4011, // Sharding required
+  4012, // Invalid API version
+  4013, // Invalid intents
+  4014, // Disallowed intents
+  4903, // Session creation failed (quota exhausted or other)
+];
+
 export class QQChannelRuntime {
   private config: RuntimeConfig;
   private ws: WebSocket | null = null;
@@ -49,8 +60,10 @@ export class QQChannelRuntime {
   private sessionId: string | null = null;
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 5;
-  private reconnectDelay = 5000;
+  private baseReconnectDelay = 5000;
   private isClosing = false;
+  private isFatalError = false;
+  private lastCloseCode: number | null = null;
 
   constructor(config: RuntimeConfig) {
     this.config = config;
@@ -60,13 +73,34 @@ export class QQChannelRuntime {
    * Start the WebSocket connection
    */
   async start(): Promise<void> {
+    // Reset fatal error flag on manual start
+    if (this.reconnectAttempts === 0) {
+      this.isFatalError = false;
+    }
+
     try {
       // Get access token first (this will be used for WebSocket auth)
       cachedAccessToken = await this.config.apiClient.getAccessToken();
 
-      // Get the gateway URL
+      // Get the gateway URL and check session limit
       const gateway = await this.config.apiClient.getGateway();
       const wsUrl = gateway.url;
+
+      // Check session_start_limit if available
+      if (gateway.session_start_limit) {
+        const { remaining, total, reset_after } = gateway.session_start_limit;
+        console.log(`[QQ-Channel] Session quota: ${remaining}/${total} remaining`);
+
+        if (remaining === 0) {
+          const resetTime = new Date(Date.now() + reset_after).toLocaleString();
+          console.error(`[QQ-Channel] Session quota exhausted! Resets at ${resetTime}`);
+          this.isFatalError = true;
+          this.config.onError(new Error(`Session quota exhausted, resets at ${resetTime}`));
+          return;
+        } else if (remaining < 10) {
+          console.warn(`[QQ-Channel] Warning: Only ${remaining} session starts remaining`);
+        }
+      }
 
       console.log(`[QQ-Channel] Connecting to WebSocket: ${wsUrl}`);
 
@@ -118,8 +152,17 @@ export class QQChannelRuntime {
     this.ws.on('close', (code, reason) => {
       console.log(`[QQ-Channel] WebSocket closed: ${code} ${reason}`);
       this.stopHeartbeat();
+      this.lastCloseCode = code;
 
-      if (!this.isClosing) {
+      // Check if this is a fatal error that should not be retried
+      if (FATAL_CLOSE_CODES.includes(code)) {
+        console.error(`[QQ-Channel] Fatal error (code ${code}), stopping reconnection attempts`);
+        this.isFatalError = true;
+        this.config.onError(new Error(`Fatal WebSocket error: ${code} ${reason}`));
+        return;
+      }
+
+      if (!this.isClosing && !this.isFatalError) {
         this.scheduleReconnect();
       }
     });
@@ -158,9 +201,15 @@ export class QQChannelRuntime {
         break;
 
       case OpCode.InvalidSession:
-        console.log('[QQ-Channel] Invalid session, reconnecting...');
+        console.log('[QQ-Channel] Invalid session received');
         this.sessionId = null;
-        this.reconnect();
+        // Use scheduleReconnect instead of immediate reconnect to respect rate limits
+        // Add a small delay before reconnecting for invalid session
+        setTimeout(() => {
+          if (!this.isClosing && !this.isFatalError) {
+            this.scheduleReconnect();
+          }
+        }, 1000);
         break;
 
       default:
@@ -296,36 +345,49 @@ export class QQChannelRuntime {
   }
 
   /**
-   * Schedule reconnection
+   * Schedule reconnection with exponential backoff
    */
   private scheduleReconnect(): void {
-    if (this.isClosing) return;
+    if (this.isClosing || this.isFatalError) return;
 
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      console.error('[QQ-Channel] Max reconnect attempts reached');
+      console.error('[QQ-Channel] Max reconnect attempts reached, giving up');
       this.config.onError(new Error('Max reconnect attempts reached'));
       return;
     }
 
     this.reconnectAttempts++;
-    const delay = this.reconnectDelay * this.reconnectAttempts;
+    // Exponential backoff: 5s, 10s, 20s, 40s, 80s
+    const delay = this.baseReconnectDelay * Math.pow(2, this.reconnectAttempts - 1);
+    // Cap at 5 minutes
+    const cappedDelay = Math.min(delay, 300000);
 
-    console.log(`[QQ-Channel] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
+    console.log(`[QQ-Channel] Reconnecting in ${cappedDelay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
 
     setTimeout(() => {
-      this.reconnect();
-    }, delay);
+      if (!this.isClosing && !this.isFatalError) {
+        this.reconnect();
+      }
+    }, cappedDelay);
   }
 
   /**
    * Reconnect to WebSocket
    */
-  private reconnect(): void {
+  private async reconnect(): Promise<void> {
     this.stopHeartbeat();
 
     if (this.ws) {
       this.ws.close();
       this.ws = null;
+    }
+
+    // Force refresh access token on reconnect
+    try {
+      console.log('[QQ-Channel] Refreshing access token before reconnect...');
+      cachedAccessToken = await this.config.apiClient.getAccessToken(true);
+    } catch (error) {
+      console.error('[QQ-Channel] Failed to refresh access token:', error);
     }
 
     this.start();
