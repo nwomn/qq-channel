@@ -1,0 +1,42 @@
+{
+  "name": "qq-channel",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "QQ Channel bot integration for Clawdbot",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "clawdbot",
+    "moltbot",
+    "qq",
+    "channel",
+    "bot"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.16.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/ws": "^8.5.10",
+    "typescript": "^5.3.3"
+  },
+  "moltbot": {
+    "extensions": [
+      "."
+    ]
+  },
+  "clawdbot": {
+    "extensions": [
+      "."
+    ]
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

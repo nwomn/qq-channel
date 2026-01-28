@@ -1,0 +1,9 @@
+{
+  "id": "qq-channel",
+  "channels": ["qq-channel"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}
