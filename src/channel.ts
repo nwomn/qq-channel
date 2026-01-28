@@ -6,10 +6,12 @@
 import type { ChannelPlugin } from './sdk-types.js';
 import { QQApiClient } from './api/client.js';
 import { QQChannelRuntime, getQQRuntime } from './runtime.js';
-import type { QQChannelAccount, MessagePayload } from './types.js';
+import { WebhookServer } from './webhook/server.js';
+import type { QQChannelAccount, MessagePayload, ConnectionMode } from './types.js';
 
 // Store for active runtimes and API clients
 const activeRuntimes: Map<string, QQChannelRuntime> = new Map();
+const activeWebhookServers: Map<string, WebhookServer> = new Map();
 const apiClients: Map<string, QQApiClient> = new Map();
 
 // Store for preventing duplicate replies to the same message
@@ -27,7 +29,15 @@ function resolveQQAccount(cfg: any, accountId: string): QQChannelAccount | null 
 
   // Support both direct config and nested accounts
   if (qqConfig.accounts && qqConfig.accounts[accountId]) {
-    return qqConfig.accounts[accountId];
+    const accountCfg = qqConfig.accounts[accountId];
+    return {
+      appId: String(accountCfg.appId),
+      appSecret: String(accountCfg.appSecret),
+      botToken: String(accountCfg.botToken),
+      sandbox: Boolean(accountCfg.sandbox),
+      connectionMode: accountCfg.connectionMode as ConnectionMode | undefined,
+      webhook: accountCfg.webhook,
+    };
   }
 
   // Direct config (when accountId is 'default')
@@ -37,6 +47,8 @@ function resolveQQAccount(cfg: any, accountId: string): QQChannelAccount | null 
       appSecret: String(qqConfig.appSecret),
       botToken: String(qqConfig.botToken),
       sandbox: Boolean(qqConfig.sandbox),
+      connectionMode: qqConfig.connectionMode as ConnectionMode | undefined,
+      webhook: qqConfig.webhook,
     };
   }
 
@@ -122,6 +134,30 @@ export const qqChannelPlugin: ChannelPlugin<QQChannelAccount> = {
         description: 'Use sandbox/test environment',
         default: false,
       },
+      connectionMode: {
+        type: 'string',
+        enum: ['websocket', 'webhook'],
+        description: 'Connection mode: websocket (default) or webhook',
+        default: 'websocket',
+      },
+      webhook: {
+        type: 'object',
+        description: 'Webhook configuration (required when connectionMode is webhook)',
+        properties: {
+          port: {
+            type: 'number',
+            description: 'HTTP server port for webhook callbacks',
+          },
+          host: {
+            type: 'string',
+            description: 'HTTP server host (default: 0.0.0.0)',
+          },
+          path: {
+            type: 'string',
+            description: 'Webhook path (default: /webhook)',
+          },
+        },
+      },
       accounts: {
         type: 'object',
         additionalProperties: {
@@ -131,6 +167,19 @@ export const qqChannelPlugin: ChannelPlugin<QQChannelAccount> = {
             appSecret: { type: 'string' },
             botToken: { type: 'string' },
             sandbox: { type: 'boolean', default: false },
+            connectionMode: {
+              type: 'string',
+              enum: ['websocket', 'webhook'],
+              default: 'websocket',
+            },
+            webhook: {
+              type: 'object',
+              properties: {
+                port: { type: 'number' },
+                host: { type: 'string' },
+                path: { type: 'string' },
+              },
+            },
           },
         },
       },
@@ -151,6 +200,7 @@ export const qqChannelPlugin: ChannelPlugin<QQChannelAccount> = {
       fields: {
         appId: account.appId,
         sandbox: account.sandbox ? 'Yes' : 'No',
+        connectionMode: account.connectionMode || 'websocket',
       },
     }),
   },
@@ -246,8 +296,8 @@ export const qqChannelPlugin: ChannelPlugin<QQChannelAccount> = {
 
       const { accountId, cfg } = ctx;
 
-      // Check if already running
-      if (activeRuntimes.has(accountId)) {
+      // Check if already running (either WebSocket or Webhook mode)
+      if (activeRuntimes.has(accountId) || activeWebhookServers.has(accountId)) {
         console.log(`[QQ-Channel] Account ${accountId} already running`);
         return null;
       }
@@ -259,189 +309,232 @@ export const qqChannelPlugin: ChannelPlugin<QQChannelAccount> = {
 
       const client = getOrCreateApiClient(accountId, account);
 
-      const runtime = new QQChannelRuntime({
-        appId: account.appId,
-        botToken: account.botToken,
-        apiClient: client,
+      // Common message handler for both WebSocket and Webhook modes
+      const handleMessage = async (message: MessagePayload, isDirect: boolean) => {
+        const core = getQQRuntime();
+        const cfg = core.config.loadConfig();
 
-        onMessage: async (message: MessagePayload, isDirect: boolean) => {
-          const core = getQQRuntime();
-          const cfg = core.config.loadConfig();
+        // Log message for debugging
+        console.log('[QQ-Channel] Received message:', {
+          id: message.id,
+          content: message.content,
+          author: message.author.username,
+          channelId: message.channel_id,
+          guildId: message.guild_id,
+          isDirect,
+        });
 
-          // Log message for debugging
-          console.log('[QQ-Channel] Received message:', {
-            id: message.id,
-            content: message.content,
-            author: message.author.username,
-            channelId: message.channel_id,
-            guildId: message.guild_id,
-            isDirect,
-          });
+        const messageText = message.content?.trim() || '';
+        if (!messageText) {
+          console.log('[QQ-Channel] Empty message, skipping');
+          return;
+        }
 
-          const messageText = message.content?.trim() || '';
-          if (!messageText) {
-            console.log('[QQ-Channel] Empty message, skipping');
-            return;
-          }
+        // Resolve agent route
+        const route = core.channel.routing.resolveAgentRoute({
+          cfg,
+          channel: 'qq-channel',
+          accountId,
+          peer: {
+            kind: isDirect ? 'dm' : 'channel',
+            id: isDirect ? message.author.id : message.channel_id,
+          },
+        });
 
-          // Resolve agent route
-          const route = core.channel.routing.resolveAgentRoute({
+        const senderName = message.author.username || message.author.id;
+        const fromLabel = isDirect ? senderName : `${senderName} in ${message.guild_id || message.channel_id}`;
+        const timestamp = message.timestamp ? new Date(message.timestamp).getTime() : Date.now();
+
+        // Check if this is a control command
+        const isCommand = core.channel.text.hasControlCommand(messageText, cfg);
+
+        // Format the message body
+        const body = core.channel.reply.formatAgentEnvelope({
+          channel: 'QQ Channel',
+          from: fromLabel,
+          timestamp,
+          body: messageText,
+        });
+
+        // Create inbound context
+        const ctxPayload = core.channel.reply.finalizeInboundContext({
+          Body: body,
+          RawBody: messageText,
+          CommandBody: messageText,
+          From: isDirect ? `qq-channel:dm:${message.author.id}` : `qq-channel:channel:${message.channel_id}`,
+          To: `qq-channel:${message.channel_id}`,
+          SessionKey: route.sessionKey,
+          AccountId: route.accountId,
+          ChatType: isDirect ? 'direct' : 'channel',
+          ConversationLabel: fromLabel,
+          SenderName: senderName,
+          SenderId: message.author.id,
+          SenderUsername: message.author.username,
+          GroupSubject: isDirect ? undefined : (message.guild_id || message.channel_id),
+          GroupChannel: isDirect ? undefined : message.channel_id,
+          Provider: 'qq-channel',
+          Surface: 'qq-channel',
+          MessageSid: message.id,
+          CommandAuthorized: isCommand ? true : undefined,  // Enable command execution
+          OriginatingChannel: 'qq-channel',
+          OriginatingTo: `qq-channel:${message.channel_id}`,
+        });
+
+        console.log('[QQ-Channel] Dispatching to AI with session:', route.sessionKey);
+
+        // Get response prefix and human delay config
+        const responsePrefix = core.channel.reply.resolveEffectiveMessagesConfig(cfg, route.agentId).responsePrefix;
+        const humanDelay = core.channel.reply.resolveHumanDelayConfig(cfg, route.agentId);
+
+        // Dispatch to AI and deliver reply
+        try {
+          await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+            ctx: ctxPayload,
             cfg,
-            channel: 'qq-channel',
-            accountId,
-            peer: {
-              kind: isDirect ? 'dm' : 'channel',
-              id: isDirect ? message.author.id : message.channel_id,
+            dispatcherOptions: {
+              responsePrefix,
+              humanDelay,
+              deliver: async (payload) => {
+                let replyText = payload.text;
+                if (!replyText) return;
+
+                // Filter sensitive URLs that QQ API rejects
+                // Replace domain names with shortened versions to avoid content policy issues
+                replyText = replyText
+                  .replace(/clawdhub\.com/g, 'clawdhub')
+                  .replace(/https?:\/\/[^\s)]+/g, '[link]');  // Replace URLs with [link] placeholder
+
+                // QQ API has a message length limit (approximately 4000 characters)
+                // Truncate if necessary to avoid API rejection
+                const MAX_MESSAGE_LENGTH = 2000; // Try smaller limit to be safe
+                if (replyText.length > MAX_MESSAGE_LENGTH) {
+                  const truncateMsg = '\n\n...(消息过长，已截断)';
+                  replyText = replyText.slice(0, MAX_MESSAGE_LENGTH - truncateMsg.length) + truncateMsg;
+                  console.log(`[QQ-Channel] Truncated long message from ${payload.text.length} to ${replyText.length} chars`);
+                }
+
+                // Log the message size for debugging
+                console.log(`[QQ-Channel] Message size: ${replyText.length} chars, content preview: ${replyText.slice(0, 80).replace(/\n/g, ' ')}...`);
+
+                // Deduplication: Skip if we already sent the same reply to this message recently
+                const messageKey = `${message.channel_id}:${message.id}`;
+                const lastReply = recentReplies.get(messageKey);
+                const now = Date.now();
+
+                if (lastReply && lastReply.text === replyText && (now - lastReply.timestamp) < REPLY_DEDUP_WINDOW_MS) {
+                  console.log('[QQ-Channel] Skipping duplicate reply to message:', message.id);
+                  return;
+                }
+
+                console.log('[QQ-Channel] Sending AI reply:', replyText.slice(0, 100) + (replyText.length > 100 ? '...' : ''));
+
+                // Use different API for direct messages vs channel messages
+                if (isDirect && message.guild_id) {
+                  // For DMs, use /dms/{guild_id}/messages
+                  await client.sendDirectMessage(message.guild_id, {
+                    content: replyText,
+                    msg_id: message.id,  // Reply to the original message
+                  });
+                } else {
+                  // For channel messages, use /channels/{channel_id}/messages
+                  await client.sendChannelMessage(message.channel_id, {
+                    content: replyText,
+                    msg_id: message.id,  // Reply to the original message
+                  });
+                }
+
+                // Record this reply
+                recentReplies.set(messageKey, { text: replyText, timestamp: now });
+
+                // Cleanup old entries
+                for (const [key, value] of recentReplies.entries()) {
+                  if (now - value.timestamp > REPLY_DEDUP_WINDOW_MS) {
+                    recentReplies.delete(key);
+                  }
+                }
+
+                console.log('[QQ-Channel] AI reply sent successfully');
+              },
+              onError: (err, info) => {
+                console.error(`[QQ-Channel] ${info.kind} reply failed:`, err);
+              },
             },
           });
-
-          const senderName = message.author.username || message.author.id;
-          const fromLabel = isDirect ? senderName : `${senderName} in ${message.guild_id || message.channel_id}`;
-          const timestamp = message.timestamp ? new Date(message.timestamp).getTime() : Date.now();
-
-          // Check if this is a control command
-          const isCommand = core.channel.text.hasControlCommand(messageText, cfg);
-
-          // Format the message body
-          const body = core.channel.reply.formatAgentEnvelope({
-            channel: 'QQ Channel',
-            from: fromLabel,
-            timestamp,
-            body: messageText,
-          });
-
-          // Create inbound context
-          const ctxPayload = core.channel.reply.finalizeInboundContext({
-            Body: body,
-            RawBody: messageText,
-            CommandBody: messageText,
-            From: isDirect ? `qq-channel:dm:${message.author.id}` : `qq-channel:channel:${message.channel_id}`,
-            To: `qq-channel:${message.channel_id}`,
-            SessionKey: route.sessionKey,
-            AccountId: route.accountId,
-            ChatType: isDirect ? 'direct' : 'channel',
-            ConversationLabel: fromLabel,
-            SenderName: senderName,
-            SenderId: message.author.id,
-            SenderUsername: message.author.username,
-            GroupSubject: isDirect ? undefined : (message.guild_id || message.channel_id),
-            GroupChannel: isDirect ? undefined : message.channel_id,
-            Provider: 'qq-channel',
-            Surface: 'qq-channel',
-            MessageSid: message.id,
-            CommandAuthorized: isCommand ? true : undefined,  // Enable command execution
-            OriginatingChannel: 'qq-channel',
-            OriginatingTo: `qq-channel:${message.channel_id}`,
-          });
-
-          console.log('[QQ-Channel] Dispatching to AI with session:', route.sessionKey);
-
-          // Get response prefix and human delay config
-          const responsePrefix = core.channel.reply.resolveEffectiveMessagesConfig(cfg, route.agentId).responsePrefix;
-          const humanDelay = core.channel.reply.resolveHumanDelayConfig(cfg, route.agentId);
-
-          // Dispatch to AI and deliver reply
-          try {
-            await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
-              ctx: ctxPayload,
-              cfg,
-              dispatcherOptions: {
-                responsePrefix,
-                humanDelay,
-                deliver: async (payload) => {
-                  let replyText = payload.text;
-                  if (!replyText) return;
-
-                  // Filter sensitive URLs that QQ API rejects
-                  // Replace domain names with shortened versions to avoid content policy issues
-                  replyText = replyText
-                    .replace(/clawdhub\.com/g, 'clawdhub')
-                    .replace(/https?:\/\/[^\s)]+/g, '[link]');  // Replace URLs with [link] placeholder
-
-                  // QQ API has a message length limit (approximately 4000 characters)
-                  // Truncate if necessary to avoid API rejection
-                  const MAX_MESSAGE_LENGTH = 2000; // Try smaller limit to be safe
-                  if (replyText.length > MAX_MESSAGE_LENGTH) {
-                    const truncateMsg = '\n\n...(消息过长，已截断)';
-                    replyText = replyText.slice(0, MAX_MESSAGE_LENGTH - truncateMsg.length) + truncateMsg;
-                    console.log(`[QQ-Channel] Truncated long message from ${payload.text.length} to ${replyText.length} chars`);
-                  }
-
-                  // Log the message size for debugging
-                  console.log(`[QQ-Channel] Message size: ${replyText.length} chars, content preview: ${replyText.slice(0, 80).replace(/\n/g, ' ')}...`);
-
-                  // Deduplication: Skip if we already sent the same reply to this message recently
-                  const messageKey = `${message.channel_id}:${message.id}`;
-                  const lastReply = recentReplies.get(messageKey);
-                  const now = Date.now();
-
-                  if (lastReply && lastReply.text === replyText && (now - lastReply.timestamp) < REPLY_DEDUP_WINDOW_MS) {
-                    console.log('[QQ-Channel] Skipping duplicate reply to message:', message.id);
-                    return;
-                  }
-
-                  console.log('[QQ-Channel] Sending AI reply:', replyText.slice(0, 100) + (replyText.length > 100 ? '...' : ''));
-
-                  // Use different API for direct messages vs channel messages
-                  if (isDirect && message.guild_id) {
-                    // For DMs, use /dms/{guild_id}/messages
-                    await client.sendDirectMessage(message.guild_id, {
-                      content: replyText,
-                      msg_id: message.id,  // Reply to the original message
-                    });
-                  } else {
-                    // For channel messages, use /channels/{channel_id}/messages
-                    await client.sendChannelMessage(message.channel_id, {
-                      content: replyText,
-                      msg_id: message.id,  // Reply to the original message
-                    });
-                  }
-
-                  // Record this reply
-                  recentReplies.set(messageKey, { text: replyText, timestamp: now });
-
-                  // Cleanup old entries
-                  for (const [key, value] of recentReplies.entries()) {
-                    if (now - value.timestamp > REPLY_DEDUP_WINDOW_MS) {
-                      recentReplies.delete(key);
-                    }
-                  }
-
-                  console.log('[QQ-Channel] AI reply sent successfully');
-                },
-                onError: (err, info) => {
-                  console.error(`[QQ-Channel] ${info.kind} reply failed:`, err);
-                },
-              },
-            });
-          } catch (err) {
-            console.error('[QQ-Channel] Failed to dispatch reply:', err);
-          }
-        },
-
-        onReady: (sessionId: string, botUser: { id: string; username: string }) => {
-          console.log(`[QQ-Channel] Account ${accountId} ready: ${botUser.username} (${botUser.id})`);
-        },
-
-        onError: (error: Error) => {
-          console.error(`[QQ-Channel] Account ${accountId} error:`, error);
-        },
-      });
-
-      activeRuntimes.set(accountId, runtime);
-
-      // Start the runtime
-      await runtime.start();
-
-      // Return stop handler
-      return async () => {
-        const rt = activeRuntimes.get(accountId);
-        if (rt) {
-          await rt.stop();
-          activeRuntimes.delete(accountId);
-          apiClients.delete(accountId);
+        } catch (err) {
+          console.error('[QQ-Channel] Failed to dispatch reply:', err);
         }
       };
+
+      // Determine connection mode (default to websocket)
+      const connectionMode = account.connectionMode || 'websocket';
+      console.log(`[QQ-Channel] Starting account ${accountId} in ${connectionMode} mode`);
+
+      if (connectionMode === 'webhook') {
+        // Webhook mode
+        if (!account.webhook?.port) {
+          throw new Error(`Account ${accountId}: webhook.port is required for webhook mode`);
+        }
+
+        const webhookServer = new WebhookServer({
+          port: account.webhook.port,
+          host: account.webhook.host,
+          path: account.webhook.path,
+          appSecret: account.appSecret,
+          handler: {
+            onMessage: handleMessage,
+            onReady: () => {
+              console.log(`[QQ-Channel] Webhook server ready for account ${accountId}`);
+            },
+            onError: (error: Error) => {
+              console.error(`[QQ-Channel] Account ${accountId} webhook error:`, error);
+            },
+          },
+        });
+
+        activeWebhookServers.set(accountId, webhookServer);
+
+        // Start the webhook server
+        await webhookServer.start();
+
+        // Return stop handler
+        return async () => {
+          const server = activeWebhookServers.get(accountId);
+          if (server) {
+            await server.stop();
+            activeWebhookServers.delete(accountId);
+            apiClients.delete(accountId);
+          }
+        };
+      } else {
+        // WebSocket mode (default)
+        const runtime = new QQChannelRuntime({
+          appId: account.appId,
+          botToken: account.botToken,
+          apiClient: client,
+          onMessage: handleMessage,
+          onReady: (sessionId: string, botUser: { id: string; username: string }) => {
+            console.log(`[QQ-Channel] Account ${accountId} ready: ${botUser.username} (${botUser.id})`);
+          },
+          onError: (error: Error) => {
+            console.error(`[QQ-Channel] Account ${accountId} error:`, error);
+          },
+        });
+
+        activeRuntimes.set(accountId, runtime);
+
+        // Start the runtime
+        await runtime.start();
+
+        // Return stop handler
+        return async () => {
+          const rt = activeRuntimes.get(accountId);
+          if (rt) {
+            await rt.stop();
+            activeRuntimes.delete(accountId);
+            apiClients.delete(accountId);
+          }
+        };
+      }
     },
   },
 };

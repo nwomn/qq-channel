@@ -1,0 +1,66 @@
+# QQ Channel Plugin Configuration Examples
+
+# Example 1: WebSocket Mode (Default)
+# Traditional mode, consumes session quota
+channels:
+  qq-channel:
+    appId: "your_app_id"
+    appSecret: "your_app_secret"
+    botToken: "your_bot_token"
+    sandbox: false
+    # connectionMode: websocket  # Optional, websocket is default
+
+# Example 2: Webhook Mode (Recommended for Production)
+# No session quota limit, requires HTTPS setup
+channels:
+  qq-channel:
+    appId: "your_app_id"
+    appSecret: "your_app_secret"
+    botToken: "your_bot_token"
+    sandbox: false
+    connectionMode: webhook
+    webhook:
+      port: 8080
+      host: "0.0.0.0"      # Optional, default is 0.0.0.0
+      path: "/webhook"      # Optional, default is /webhook
+
+# Example 3: Multiple Accounts with Mixed Modes
+channels:
+  qq-channel:
+    accounts:
+      production-bot:
+        appId: "prod_app_id"
+        appSecret: "prod_app_secret"
+        botToken: "prod_bot_token"
+        connectionMode: webhook
+        webhook:
+          port: 8080
+          path: "/webhook/prod"
+
+      test-bot:
+        appId: "test_app_id"
+        appSecret: "test_app_secret"
+        botToken: "test_bot_token"
+        connectionMode: websocket  # Test with WebSocket
+        sandbox: true
+
+# Example 4: Custom Port and Path
+channels:
+  qq-channel:
+    appId: "your_app_id"
+    appSecret: "your_app_secret"
+    botToken: "your_bot_token"
+    connectionMode: webhook
+    webhook:
+      port: 3000
+      host: "127.0.0.1"     # Listen only on localhost
+      path: "/my-custom-webhook-path"
+
+# After configuration, setup HTTPS access:
+# 1. Use Cloudflare Tunnel (recommended):
+#    cloudflared tunnel --url http://localhost:8080
+#
+# 2. Or use Nginx + Let's Encrypt with your own domain
+#
+# 3. Configure callback URL in QQ Open Platform:
+#    https://your-domain.com/webhook

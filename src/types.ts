@@ -2,6 +2,16 @@
  * QQ Channel Bot API Types
  */
 
+// Connection mode for the bot
+export type ConnectionMode = 'websocket' | 'webhook';
+
+// Webhook configuration
+export interface WebhookConfig {
+  port: number;
+  host?: string;
+  path?: string;
+}
+
 // OAuth token response
 export interface TokenResponse {
   access_token: string;
@@ -164,6 +174,8 @@ export interface QQChannelAccount {
   appSecret: string;
   botToken: string;
   sandbox?: boolean;
+  connectionMode?: ConnectionMode;
+  webhook?: WebhookConfig;
 }
 
 // DMS (Direct Message Session) response
@@ -172,3 +184,44 @@ export interface DMSResponse {
   channel_id: string;
   create_time: string;
 }
+
+// Webhook payload structure (similar to WebSocket but with different op codes)
+export interface WebhookPayload<T = unknown> {
+  op: WebhookOpCode;
+  d: T;
+  id?: string;
+  t?: string;
+}
+
+// Webhook opcodes
+export enum WebhookOpCode {
+  Dispatch = 0,
+  HTTPCallbackAck = 12,
+  URLValidation = 13,
+}
+
+// URL validation payload (op=13)
+export interface URLValidationPayload {
+  plain_token: string;
+  event_ts: string;
+}
+
+// URL validation response
+export interface URLValidationResponse {
+  plain_token: string;
+  signature: string;
+}
+
+// Webhook event payload wrapper
+export interface WebhookEventPayload<T = unknown> {
+  op: WebhookOpCode;
+  d: {
+    event_ts: string;
+    event_id: string;
+    event_type: string;
+    event_content: T;
+  };
+  id?: string;
+  t?: string;
+}
+
